@@ -42,3 +42,8 @@ android {
 flutter {
     source = "../.."
 }
+
+dependencies {
+    implementation("org.tensorflow:tensorflow-lite:2.12.0")
+}
+

@@ -17,51 +17,83 @@ class FaceHome extends StatefulWidget {
 class _FaceHomeState extends State<FaceHome> {
   late CameraController _controller;
   bool _cameraReady = false;
+  bool _isProcessing = false;
+  bool _isFaceProper = false;
   final _faceService = FaceService();
   final _api = ApiService();
-
-  final int classId = 101; // set as needed
+  final int classId = 101;
+  final ValueNotifier<bool> _isProcessingNotifier = ValueNotifier(false);
+  final ValueNotifier<bool> _isFaceProperNotifier = ValueNotifier(false);
 
   @override
   void initState() {
     super.initState();
     debugPrint("Initializing camera...");
     _initCamera();
+    _loadModel();
+    _startFaceSizeCheck();
+  }
+
+  Future<void> _loadModel() async {
+    await _faceService.loadModel(context);
   }
 
   Future<void> _initCamera() async {
     final camera = widget.cameras.firstWhere(
-          (c) => c.lensDirection == CameraLensDirection.front,
+          (c) => c.lensDirection == CameraLensDirection.back,
       orElse: () => widget.cameras.first,
     );
-    _controller = CameraController(camera, ResolutionPreset.high, enableAudio: false);
+    _controller = CameraController(
+      camera,
+      ResolutionPreset.high, // Changed to high for sharper images
+      enableAudio: false,
+      imageFormatGroup: ImageFormatGroup.jpeg,
+    );
 
     try {
       await _controller.initialize();
+      await _controller.setFocusMode(FocusMode.auto);
+      await _controller.setFocusPoint(const Offset(0.5, 0.5));
+      await _controller.setExposureMode(ExposureMode.auto); // Added for lighting
       if (!mounted) return;
       setState(() => _cameraReady = true);
-      debugPrint("Camera initialized successfully: ${camera.name}");
+      debugPrint("Camera initialized: ${camera.name}, lensDirection: ${camera.lensDirection}, resolution: ${_controller.value.previewSize}");
     } catch (e) {
       debugPrint("Camera initialization failed: $e");
     }
   }
 
-  @override
-  void dispose() {
-    debugPrint("Disposing camera and face service...");
-    _controller.dispose();
-    _faceService.dispose();
-    super.dispose();
+  Future<void> _startFaceSizeCheck() async {
+    while (mounted) {
+      if (!_isProcessing && _cameraReady) {
+        final bytes = await _captureJpegBytes(silent: true);
+        if (bytes != null) {
+          final isProper = await _faceService.isFaceProperlySized(bytes);
+          if (mounted) {
+            setState(() => _isFaceProper = isProper);
+            _isFaceProperNotifier.value = isProper;
+          }
+        }
+      }
+      await Future.delayed(const Duration(milliseconds: 500));
+    }
   }
 
-  Future<Uint8List?> _captureJpegBytes() async {
+  Future<Uint8List?> _captureJpegBytes({bool silent = false}) async {
     try {
+      await _controller.setFocusPoint(const Offset(0.5, 0.5));
+      await _controller.setFocusMode(FocusMode.locked);
       final shot = await _controller.takePicture();
       final bytes = await shot.readAsBytes();
-      debugPrint("Captured image of size: ${bytes.lengthInBytes} bytes");
+      await _controller.setFocusMode(FocusMode.auto);
+      if (!silent) {
+        debugPrint("Captured image of size: ${bytes.lengthInBytes} bytes");
+      }
       return bytes;
     } catch (e) {
-      debugPrint('Capture error: $e');
+      if (!silent) {
+        debugPrint('Capture error: $e');
+      }
       return null;
     }
   }
@@ -97,91 +129,163 @@ class _FaceHomeState extends State<FaceHome> {
   }
 
   Future<void> _registerStudent(String name, String rollNo) async {
-    if (name.isEmpty || rollNo.isEmpty) {
-      _snack('Name & Roll required');
-      debugPrint("Registration failed: empty name or roll");
+    if (_isProcessing) {
+      _snack('Processing in progress, please wait...');
+      debugPrint("Registration skipped: already processing");
       return;
     }
-
-    final bytes = await _captureJpegBytes();
-    if (bytes == null) {
-      _snack('Failed to capture image.');
-      debugPrint("Registration failed: capture returned null");
+    if (!_isFaceProper) {
+      _snack('Please adjust face position (30-50 cm, centered)');
+      debugPrint("Registration skipped: improper face size");
       return;
     }
+    _isProcessing = true;
+    _isProcessingNotifier.value = true;
 
-    _snack('Processing face...');
-    debugPrint("Processing face for student registration...");
-    final embedding = await _faceService.processFace(bytes);
-    if (embedding == null) {
-      _snack('Failed to process face.');
-      debugPrint("Face embedding returned null");
-      return;
-    }
+    try {
+      if (name.isEmpty || rollNo.isEmpty) {
+        _snack('Name & Roll required');
+        debugPrint("Registration failed: empty name or roll");
+        return;
+      }
 
-    debugPrint("Face embedding generated successfully, registering via API...");
-    final success = await _api.registerStudent(
-      name: name,
-      rollNo: rollNo,
-      classId: classId,
-      embedding: embedding,
-    );
+      final bytes = await _captureJpegBytes();
+      if (bytes == null) {
+        _snack('Failed to capture image.');
+        debugPrint("Registration failed: capture returned null");
+        return;
+      }
 
-    if (success) {
-      _snack('Student registered');
-      debugPrint("Student registered successfully: $name");
-    } else {
-      _snack('Register failed');
-      debugPrint("API registration failed for $name");
+      _snack('Processing face...');
+      debugPrint("Processing face for student registration...");
+      final embedding = await _faceService.processFace(bytes);
+      if (embedding == null) {
+        _snack('Failed to process face.');
+        debugPrint("Face embedding returned null");
+        return;
+      }
+
+      debugPrint("Face embedding generated successfully, registering via API...");
+      final success = await _api.registerStudent(
+        name: name,
+        rollNo: rollNo,
+        classId: classId,
+        embedding: embedding,
+      );
+
+      if (success) {
+        _snack('Student registered');
+        debugPrint("Student registered successfully: $name");
+      } else {
+        _snack('Register failed');
+        debugPrint("API registration failed for $name");
+      }
+    } catch (e) {
+      _snack('Error: $e');
+      debugPrint("Error in _registerStudent: $e");
+    } finally {
+      _isProcessing = false;
+      _isProcessingNotifier.value = false;
     }
   }
 
   Future<void> _takeAttendance() async {
-    final bytes = await _captureJpegBytes();
-    if (bytes == null) {
-      _snack('Failed to capture image.');
-      debugPrint("Attendance capture failed");
+    if (_isProcessing) {
+      _snack('Processing in progress, please wait...');
+      debugPrint("Attendance skipped: already processing");
       return;
     }
-
-    _snack('Processing face...');
-    debugPrint("Processing face for attendance...");
-    final capturedEmbedding = await _faceService.processFace(bytes);
-    if (capturedEmbedding == null) {
-      _snack('Failed to process face.');
-      debugPrint("Face embedding for attendance returned null");
+    if (!_isFaceProper) {
+      _snack('Please adjust face position (30-50 cm, centered)');
+      debugPrint("Attendance skipped: improper face size");
       return;
     }
+    _isProcessing = true;
+    _isProcessingNotifier.value = true;
 
-    _snack('Fetching class list...');
-    debugPrint("Fetching students for classId $classId...");
-    final students = await _api.fetchClassStudents(classId);
-    if (students == null || students.isEmpty) {
-      _snack('No students found');
-      debugPrint("No students returned from API");
-      return;
-    }
-
-    double bestSim = -2.0;
-    Student? bestMatch;
-
-    for (final s in students) {
-      final sim = FaceService.cosineSimilarity(capturedEmbedding, s.faceEmbedding);
-      debugPrint("Similarity with ${s.name}: $sim");
-      if (sim > bestSim) {
-        bestSim = sim;
-        bestMatch = s;
+    try {
+      final bytes = await _captureJpegBytes();
+      if (bytes == null) {
+        _snack('Failed to capture image.');
+        debugPrint("Attendance capture failed");
+        return;
       }
-    }
 
-    const double THRESHOLD = 0.80;
-    if (bestMatch != null && bestSim >= THRESHOLD) {
-      _snack('Matched: ${bestMatch.name} (sim=${bestSim.toStringAsFixed(3)})');
-      debugPrint("Attendance recorded for ${bestMatch.name}");
-      await _api.postAttendance(classId: classId, studentId: bestMatch.id);
-    } else {
-      _snack('No match (best=${bestSim.toStringAsFixed(3)})');
-      debugPrint("No matching student found. Best similarity: $bestSim");
+      _snack('Processing face...');
+      debugPrint("Processing face for attendance...");
+      final capturedEmbedding = await _faceService.processFace(bytes);
+      if (capturedEmbedding == null) {
+        _snack('Failed to process face.');
+        debugPrint("Face embedding for attendance returned null");
+        return;
+      }
+
+      _snack('Fetching class list...');
+      debugPrint("Fetching students for classId $classId...");
+      final students = await _api.fetchClassStudents(classId);
+      if (students == null) {
+        _snack('Error fetching students');
+        debugPrint("Failed to fetch students: returned null");
+        return;
+      }
+      if (students.isEmpty) {
+        _snack('No students found');
+        debugPrint("No students found for classId $classId");
+        return;
+      }
+
+      double bestSim = -2.0;
+      Student? bestMatch;
+
+      for (final s in students) {
+        if (s.faceEmbedding.length != capturedEmbedding.length) {
+          debugPrint("Embedding length mismatch for ${s.name}: expected ${capturedEmbedding.length}, got ${s.faceEmbedding.length}");
+          continue;
+        }
+        final sim = FaceService.cosineSimilarity(capturedEmbedding, s.faceEmbedding);
+        debugPrint("Similarity with ${s.name}: $sim");
+        if (sim > bestSim) {
+          bestSim = sim;
+          bestMatch = s;
+        }
+      }
+
+      const double THRESHOLD = 0.80;
+      if (bestMatch != null) {
+        if (bestSim >= THRESHOLD) {
+          _snack('Matched: ${bestMatch.name} (sim=${bestSim.toStringAsFixed(3)})');
+          debugPrint("Attendance recorded for ${bestMatch.name}");
+          final success = await _api.postAttendance(classId: classId, studentId: bestMatch.id);
+          if (success) {
+            _snack('Attendance recorded for ${bestMatch.name}');
+            debugPrint("Attendance successfully recorded for ${bestMatch.name}");
+          } else {
+            _snack('Failed to record attendance');
+            debugPrint("Failed to record attendance for ${bestMatch.name}");
+          }
+        } else {
+          _snack('Best match: ${bestMatch.name} (sim=${bestSim.toStringAsFixed(3)})');
+          debugPrint("Recording attendance for best match ${bestMatch.name} (sim=$bestSim)");
+          final success = await _api.postAttendance(classId: classId, studentId: bestMatch.id);
+          if (success) {
+            _snack('Attendance recorded for ${bestMatch.name}');
+            debugPrint("Attendance successfully recorded for ${bestMatch.name}");
+          } else {
+            _snack('Failed to record attendance');
+            debugPrint("Failed to record attendance for ${bestMatch.name}");
+          }
+        }
+      } else {
+        _snack('No match (best=${bestSim.toStringAsFixed(3)})');
+        debugPrint("No matching student found. Best similarity: $bestSim");
+      }
+    } catch (e) {
+      _snack('Error: $e');
+      debugPrint("Error in _takeAttendance: $e");
+    } finally {
+      _isProcessing = false;
+      _isProcessingNotifier.value = false;
+      await Future.delayed(const Duration(milliseconds: 500));
     }
   }
 
@@ -192,41 +296,97 @@ class _FaceHomeState extends State<FaceHome> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Face Attendance')),
+      backgroundColor: Colors.black,
+      extendBodyBehindAppBar: true,
+      appBar: AppBar(
+        title: const Text('Face Attendance'),
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+      ),
       body: !_cameraReady
           ? const Center(child: CircularProgressIndicator())
-          : Stack(
-        children: [
-          CameraPreview(_controller),
-          Center(
-            child: Container(
-              width: 260,
-              height: 320,
-              decoration: BoxDecoration(
-                border: Border.all(color: Colors.white, width: 3),
-                borderRadius: BorderRadius.circular(160),
+          : ValueListenableBuilder<bool>(
+        valueListenable: _isProcessingNotifier,
+        builder: (context, isProcessing, child) => ValueListenableBuilder<bool>(
+          valueListenable: _isFaceProperNotifier,
+          builder: (context, isFaceProper, child) => Stack(
+            children: [
+              Center(
+                child: FittedBox(
+                  fit: BoxFit.contain,
+                  child: SizedBox(
+                    width: MediaQuery.of(context).size.width,
+                    height: MediaQuery.of(context).size.width * _controller.value.aspectRatio,
+                    child: CameraPreview(_controller),
+                  ),
+                ),
               ),
-            ),
-          ),
-          Positioned(
-            left: 16,
-            right: 16,
-            bottom: 24,
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-              children: [
-                FilledButton.tonal(
-                  onPressed: _registerStudentDialog,
-                  child: const Text('Register'),
+              Center(
+                child: Container(
+                  width: 260,
+                  height: 320,
+                  decoration: BoxDecoration(
+                    border: Border.all(
+                      color: isFaceProper ? Colors.green : Colors.red,
+                      width: 3,
+                    ),
+                    borderRadius: BorderRadius.circular(160),
+                  ),
                 ),
-                FilledButton(
-                  onPressed: _takeAttendance,
-                  child: const Text('Take Attendance'),
+              ),
+              Center(
+                child: Padding(
+                  padding: const EdgeInsets.only(top: 400),
+                  child: Text(
+                    isFaceProper
+                        ? 'Face position OK'
+                        : 'Adjust face to 30-50 cm, center in frame',
+                    style: TextStyle(
+                      color: isFaceProper ? Colors.green : Colors.red,
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
                 ),
-              ],
-            ),
+              ),
+              if (isProcessing)
+                const Center(child: CircularProgressIndicator()),
+              Align(
+                alignment: Alignment.bottomCenter,
+                child: SafeArea(
+                  top: false,
+                  child: Container(
+                    height: 64,
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                      children: [
+                        FilledButton.tonal(
+                          onPressed: isProcessing || !isFaceProper
+                              ? null
+                              : _registerStudentDialog,
+                          style: FilledButton.styleFrom(
+                            minimumSize: const Size(120, 48),
+                          ),
+                          child: const Text('Register'),
+                        ),
+                        FilledButton(
+                          onPressed: isProcessing || !isFaceProper
+                              ? null
+                              : _takeAttendance,
+                          style: FilledButton.styleFrom(
+                            minimumSize: const Size(120, 48),
+                          ),
+                          child: const Text('Take Attendance'),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ],
           ),
-        ],
+        ),
       ),
     );
   }
